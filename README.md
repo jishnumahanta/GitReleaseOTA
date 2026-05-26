@@ -13,7 +13,7 @@ SHA-256 integrity verification. FreeRTOS-safe. One-command release pipeline.
 [![GitHub Release](https://img.shields.io/github/v/release/jishnumahanta/GitReleaseOTA?logo=github)](https://github.com/jishnumahanta/GitReleaseOTA/releases/latest)
 [![ESP32](https://img.shields.io/badge/ESP32-S3%20%7C%20S2%20%7C%20Classic-red.svg)](https://www.espressif.com/en/products/socs/esp32)
 
-Built from production firmware powering [SmartPot](https://github.com/jishnumahanta) — an AI-powered ESP32-S3 IoT plant monitor.
+Built from production firmware powering [SMARTPlantMonitor](https://github.com/jishnumahanta) — an AI-powered ESP32-S3 IoT plant monitor.
 
 </div>
 
