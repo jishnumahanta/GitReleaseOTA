@@ -19,6 +19,30 @@ Built from production firmware powering [SMARTPlantMonitor](https://github.com/j
 
 ---
 
+## Install
+
+**PlatformIO** — add to the `lib_deps` option of your `[env:]` section in `platformio.ini`:
+
+```ini
+lib_deps = jishnumahanta/GitReleaseOTA@^1.0.2
+```
+
+Or from the PlatformIO Core CLI:
+
+```bash
+pio pkg install --library "jishnumahanta/GitReleaseOTA@^1.0.2"
+```
+
+**Arduino IDE** — Sketch → Include Library → Add .ZIP Library, or clone this repository into `~/Documents/Arduino/libraries/`.
+
+Then include it:
+
+```cpp
+#include <ota_updater.h>
+```
+
+---
+
 ## Why GitReleaseOTA?
 
 | | ArduinoOTA | ElegantOTA | **GitReleaseOTA** |
