@@ -5,7 +5,7 @@
 **Deployment infrastructure for ESP32 firmware — powered by GitHub Releases.**
 
 Stream firmware OTA updates directly from GitHub Releases.  
-SHA-256 integrity verification. FreeRTOS-safe. One-command release pipeline.
+SHA-256 integrity verification and optional ECDSA-signed releases. FreeRTOS-safe. One-command release pipeline.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-Compatible-orange.svg?logo=platformio)](https://platformio.org/lib/show/0/GitReleaseOTA)
@@ -181,7 +181,9 @@ otaBegin("your-username", "your-releases-repo", "1.0.0");
       │  │ UP_TO_DATE  │           │ ERROR_WIFI            │
       │  └─────────────┘           │ ERROR_HTTP            │
       │         │ update found      │ ERROR_PARSE           │
-      │         ▼                  └──────────────────────┘
+      │         ▼                  │ ERROR_SIGNATURE       │
+      │                            │ ERROR_CONFIG          │
+      │                            └──────────────────────┘
       │  ┌─────────────────┐
       │  │ UPDATE_AVAILABLE │
       │  └───────┬──────────┘
@@ -208,7 +210,7 @@ otaBegin("your-username", "your-releases-repo", "1.0.0");
 
 ## Serial Monitor Output
 
-What you see on a successful OTA update:
+What a successful OTA update looks like (illustrative output):
 
 ```
 [OTA] firmware v1.0.2
@@ -234,7 +236,6 @@ rst:0xc (SW_CPU_RESET)...
 [OTA] firmware v1.0.3      ← new firmware running
 ```
 
-![Serial monitor showing a complete OTA update from v1.0.2 to v1.0.3](docs/serial_monitor_ota.png)
 
 ---
 
@@ -410,7 +411,6 @@ The script automatically: reads version → bumps → writes back → builds →
 
 Safety properties: release notes are JSON-escaped (quotes and newlines are fine), an existing tag is never overwritten, and the releases repo is only bootstrapped when GitHub says it is empty. Any other API failure (network, auth, rate limit) aborts without touching the repo.
 
-![release.sh terminal output showing a successful v1.0.2 → v1.0.3 release](docs/release_script_output.png)
 
 ---
 
@@ -418,7 +418,6 @@ Safety properties: release notes are JSON-escaped (quotes and newlines are fine)
 
 Each release automatically uploads `firmware.bin` and `version.json` to GitHub Releases, which acts as the CDN for all devices in the field:
 
-![GitHub Releases page showing v1.0.3 with firmware.bin and version.json assets](docs/github_releases_page.png)
 
 ---
 
@@ -488,7 +487,6 @@ bool        otaMarkValid();
 | Partition too small | `Update.begin()` fails → `OTA_ERROR_NO_SPACE` — fix `partitions.csv` |
 | Corrupt `version.json` | State → `OTA_ERROR_PARSE` — binary never downloaded, devices stay on current version |
 
-![Terminal showing SHA-256 mismatch abort (left) and No WiFi error (right) — device continues running normally in both cases](docs/ota_failure_recovery.png)
 
 ---
 

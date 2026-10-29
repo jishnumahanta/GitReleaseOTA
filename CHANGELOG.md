@@ -26,6 +26,7 @@
 - `GitReleaseOTA.h` (Arduino-style header; `ota_updater.h` still works), `keywords.txt`.
 - `release.sh --dry-run`, `--allow-dirty`, `--no-commit`.
 - Host unit tests, `release.sh` end-to-end tests and a CI workflow.
+- README: removed the four mock-up screenshots (they were generated images, not real captures, and showed outdated output); the serial log is now marked illustrative.
 
 ### Changed (behaviour)
 - A `version.json` without `sha256` is **refused** unless `otaAllowUnverified(true)`. `release.sh` always writes it.
