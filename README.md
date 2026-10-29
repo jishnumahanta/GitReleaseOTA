@@ -617,4 +617,6 @@ Built with ❤️ for embedded engineers who ship to production.
 
 **[GitHub](https://github.com/jishnumahanta/GitReleaseOTA)** · **[Issues](https://github.com/jishnumahanta/GitReleaseOTA/issues)** · **[SmartPot](https://github.com/jishnumahanta)**
 
+**Jishnu Mahanta** — [Portfolio](https://www.jishnumahanta.in) · [LinkedIn](https://www.linkedin.com/in/jishnumahanta) · [X](https://x.com/jishnumahanta17) · [Instagram](https://www.instagram.com/mahantajishnu) · [Threads](https://www.threads.com/@mahantajishnu)
+
 </div>
