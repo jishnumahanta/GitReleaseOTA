@@ -14,3 +14,7 @@ version.json
 .vscode/
 .idea/
 *.swp
+
+# Signing keys — never commit
+ota_signing_key*.pem
+*.key

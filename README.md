@@ -24,22 +24,26 @@ Built from production firmware powering [SMARTPlantMonitor](https://github.com/j
 **PlatformIO** — add to the `lib_deps` option of your `[env:]` section in `platformio.ini`:
 
 ```ini
-lib_deps = jishnumahanta/GitReleaseOTA@^1.0.2
+lib_deps = jishnumahanta/GitReleaseOTA@^1.1.0
 ```
 
 Or from the PlatformIO Core CLI:
 
 ```bash
-pio pkg install --library "jishnumahanta/GitReleaseOTA@^1.0.2"
+pio pkg install --library "jishnumahanta/GitReleaseOTA@^1.1.0"
 ```
 
 **Arduino IDE** — Sketch → Include Library → Add .ZIP Library, or clone this repository into `~/Documents/Arduino/libraries/`.
 
-Then include it:
+Then include it and configure it at runtime (works in both the Arduino IDE and PlatformIO):
 
 ```cpp
-#include <ota_updater.h>
+#include <GitReleaseOTA.h>   // (ota_updater.h still works)
+
+otaBegin("your-username", "your-releases-repo", "1.0.0");
 ```
+
+> **Upgrading from 1.0.x?** See the [CHANGELOG](CHANGELOG.md). Short version: `otaInit()` + `#define`s still work, but a release without `sha256` is now refused, `otaInstall()` requires a successful check first, and `OTA_VERSION_URL` / `OTA_BIN_URL` are gone.
 
 ---
 
@@ -50,12 +54,13 @@ Then include it:
 | Transport | Local Wi-Fi | HTTP upload | **HTTPS GitHub CDN** |
 | Custom server | ❌ Not needed | ✅ Required | **❌ Not needed** |
 | SHA-256 integrity | ❌ | ❌ | **✅ Hardware-accelerated** |
+| Signed releases | ❌ | ❌ | **✅ Optional ECDSA P-256** |
 | Release automation | ❌ | ❌ | **✅ One command** |
 | CI/CD friendly | ❌ | ❌ | **✅ `gh release create`** |
 | Version comparison | String | String | **✅ Semantic (1.10.0 > 1.9.0)** |
 | Production-grade | ❌ | Partial | **✅** |
 
-> **The real value**: No custom OTA server. No manual uploads. One command and every device in the field updates itself — with cryptographic integrity verification.
+> **The real value**: No custom OTA server. No manual uploads. One command and every device in the field updates itself — with SHA-256 integrity checking and, if you add a signing key, firmware that only *you* can publish.
 
 ---
 
@@ -70,8 +75,9 @@ Then include it:
   ┌─────────────────────┐
   │  Fetch version.json  │  github.com/.../releases/latest/download/
   └──────────┬──────────┘
-             │  Parse & compare versions
-             │  versionGreater("1.0.3", "1.0.2")  → true
+             │  Parse & compare versions (semver)
+             │  1.0.3 > 1.0.2  → true
+             │  Verify signature over "version:sha256"  (if a public key is set)
              ▼
   ┌─────────────────────┐
   │  UPDATE_AVAILABLE    │
@@ -112,10 +118,12 @@ Then include it:
        ├─ Write back to header          #define FW_VERSION "1.0.3"
        ├─ pio run  (build firmware.bin)
        ├─ shasum -a 256 firmware.bin
+       ├─ Sign "1.0.3:<sha256>"         (if OTA_SIGNING_KEY is set)
        ├─ Write version.json
        │    { "version": "1.0.3",
        │      "bin": "github.com/.../firmware.bin",
        │      "sha256": "a3f8c1...",
+       │      "sig": "MEUCIQ...",
        │      "notes": "Fix crash" }
        │
        └─ gh release create v1.0.3 ──► GitHub Release
@@ -180,7 +188,7 @@ Then include it:
       │          │ otaInstall()
       │          ▼
       │  ┌─────────────┐
-      │  │ DOWNLOADING  │──── stall / HTTP ──► ERROR_FLASH
+      │  │ DOWNLOADING  │──── stall / HTTP / truncated ──► ERROR_FLASH / ERROR_HTTP
       │  └──────┬──────┘
       │         │
       │         ▼
@@ -239,35 +247,30 @@ String compare:  "1.10.0" < "1.9.0"  ← ❌ WRONG
 Numeric compare: 1.10.0  > 1.9.0    ← ✅ CORRECT
 ```
 
-GitReleaseOTA parses each component as integers:
+GitReleaseOTA implements [semantic version](https://semver.org) precedence (`src/gro_core.cpp`, unit-tested on a host machine):
 
-```cpp
-static bool versionGreater(const String &a, const String &b) {
-  int ma=0,mi_a=0,pa=0, mb=0,mi_b=0,pb=0;
-  sscanf(a.c_str(), "%d.%d.%d", &ma, &mi_a, &pa);
-  sscanf(b.c_str(), "%d.%d.%d", &mb, &mi_b, &pb);
-  if (ma!=mb)     return ma > mb;
-  if (mi_a!=mi_b) return mi_a > mi_b;
-  return pa > pb;
-}
-```
-
-✅ `1.10.0 > 1.9.0` — correct  
-✅ `2.0.0 > 1.99.99` — correct  
-✅ `1.0.0 == 1.0.0` — no spurious update
+✅ `1.10.0 > 1.9.0` — numeric, not lexicographic  
+✅ `2.0.0 > 1.99.99`  
+✅ `1.0.0 == 1.0.0` — no spurious update  
+✅ `v1.2.3 == 1.2.3` — optional leading `v`  
+✅ `1.0.0-rc1 < 1.0.0` — pre-releases sort below the release; `1.0.0+build5 == 1.0.0`  
+❌ Anything that isn't a version (`""`, `abc`, `1.2.3.4`) is rejected as `OTA_ERROR_PARSE` — it is never silently treated as `0.0.0`
 
 ---
 
 ## Features
 
 - **GitHub Releases as OTA server** — no custom server, no infrastructure
-- **SHA-256 integrity check** — hardware-accelerated via mbedTLS on all ESP32 variants
-- **Proper semantic versioning** — `1.10.0 > 1.9.0`, not lexicographic
+- **SHA-256 integrity check** — computed while streaming through mbedTLS (hardware-accelerated where the chip supports it); a release without a hash is refused
+- **Optional ECDSA P-256 signatures** — devices only accept firmware signed by your key, regardless of the network in between
+- **Proper semantic versioning** — `1.10.0 > 1.9.0`, pre-releases, `v` prefix
 - **Non-blocking version check** — FreeRTOS task on core 0, never stalls `loop()`
-- **Maintenance callback** — safely stop I2S, sensors, LEDs before flash begins
+- **Thread-safe state** — `otaGetInfo()` / `otaGetState()` are safe from any task; concurrent checks/installs are refused instead of racing
+- **Maintenance + failure callbacks** — stop I2S, sensors, LEDs before the flash, and restart them if it fails
+- **Truncation-proof downloads** — a dropped connection is an error, not a "complete" image
 - **Redirect following** — handles GitHub's multi-step redirect chain automatically
-- **Atomic OTA** — bad hash or mid-flash power loss leaves current firmware intact
-- **Automated release script** — one command: bump → build → SHA-256 → publish
+- **Atomic OTA** — bad hash/signature or mid-flash power loss leaves current firmware intact
+- **Automated release script** — one command: bump → build → SHA-256 → sign → publish, safe to re-run after failures (`--dry-run` supported)
 
 ---
 
@@ -276,8 +279,10 @@ static bool versionGreater(const String &a, const String &b) {
 ```
 GitReleaseOTA/
 ├── src/
-│   ├── ota_updater.h          # Header — include this in your project
-│   └── ota_updater.cpp        # Implementation
+│   ├── GitReleaseOTA.h        # Header — include this in your project
+│   ├── ota_updater.h          # Public API (GitReleaseOTA.h includes it)
+│   ├── ota_updater.cpp        # ESP32 implementation (HTTP, flashing, state)
+│   ├── gro_core.h / .cpp      # Pure logic: semver, JSON, SHA-256, signatures (host-testable)
 ├── examples/
 │   ├── BasicOTA/
 │   │   └── BasicOTA.ino       # Minimal working example
@@ -285,8 +290,11 @@ GitReleaseOTA/
 │   │   └── FreeRTOSMultiTask.ino
 │   └── ScheduledOTA/
 │       └── ScheduledOTA.ino
+├── tests/                     # Host unit tests + release.sh end-to-end tests (see Testing)
+├── .github/workflows/ci.yml   # Runs the tests and builds every example
 ├── release.sh                 # Release automation script
-├── library.properties
+├── CHANGELOG.md
+├── library.properties / library.json / keywords.txt
 └── README.md
 ```
 
@@ -304,56 +312,53 @@ The releases repo can be empty — `release.sh` bootstraps it on first run.
 ### Step 2 — Install dependencies
 
 ```bash
-brew install gh && gh auth login
-# PlatformIO expected at ~/.platformio/penv/bin/pio
+brew install gh jq && gh auth login
+# PlatformIO: `pio` on your PATH, or at ~/.platformio/penv/bin/pio
 ```
 
 ### Step 3 — Configure `release.sh`
 
+Edit the variables at the top of `release.sh`, or export them:
+
 ```bash
 GITHUB_USER="your-username"
 GITHUB_REPO="your-releases-repo"
-VERSION_FILE="src/ota_updater.h"
+VERSION_FILE="src/version.h"     # YOUR firmware file with: #define FW_VERSION "1.0.0"
 BUILD_ENV="esp32dev"
 FIRMWARE_PATH=".pio/build/${BUILD_ENV}/firmware.bin"
 ```
 
+`VERSION_FILE` must contain exactly one real `#define FW_VERSION "x.y.z"` line (comments don't count). The script refuses to run on a dirty git tree, and restores the file if anything fails before the release is published.
+
+### Step 4 — (Recommended) Create a signing key
+
 ```bash
-chmod +x release.sh
+./release.sh keygen            # writes ota_signing_key.pem (git-ignored) and prints the public key
 ```
 
-### Step 4 — Configure your firmware
-
-```cpp
-#define FW_VERSION       "1.0.0"
-#define OTA_GITHUB_USER  "your-username"
-#define OTA_GITHUB_REPO  "your-releases-repo"
-#include "ota_updater.h"
-```
-
-Or via `platformio.ini`:
-
-```ini
-build_flags =
-    -D FW_VERSION='"1.0.0"'
-    -D OTA_GITHUB_USER='"your-username"'
-    -D OTA_GITHUB_REPO='"your-releases-repo"'
-```
+Paste the printed `OTA_PUBLIC_KEY` into your firmware (Step 5) and release with `OTA_SIGNING_KEY=ota_signing_key.pem ./release.sh patch "notes"`. Back the key up somewhere safe: devices that trust it will reject releases signed by any other key.
 
 ### Step 5 — Add to your firmware
 
 ```cpp
-#include "ota_updater.h"
+#include <WiFi.h>
+#include <GitReleaseOTA.h>
 
-void beforeFlash() { i2sStop(); ledOff(); }
+const char* FW_VERSION_STR = "1.0.0";   // keep in sync with FW_VERSION used by release.sh
+// const char* OTA_PUBLIC_KEY = "-----BEGIN PUBLIC KEY-----\n...";   // from ./release.sh keygen
+
+void beforeFlash()      { i2sStop(); ledOff(); }
+void afterFailedFlash() { i2sStart(); ledOn(); }
 
 void setup() {
   Serial.begin(115200);
   WiFi.begin("SSID", "PASSWORD");
   while (WiFi.status() != WL_CONNECTED) delay(500);
 
+  otaBegin("your-username", "your-releases-repo", FW_VERSION_STR);
+  // otaSetPublicKey(OTA_PUBLIC_KEY);
   otaSetMaintenanceCallback(beforeFlash);
-  otaInit();
+  otaSetFailureCallback(afterFailedFlash);
   otaCheckAsync();
 }
 
@@ -372,6 +377,17 @@ For FreeRTOS tasks touching hardware, add to each task loop:
 if (g_otaInProgress) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 ```
 
+> **Stack size:** `otaInstall()` does the TLS handshake on the *calling* task's stack. Call it from a task with at least ~10 KB (the Arduino `loop()` task's default 8 KB works; a 4 KB task will overflow).
+
+**Compile-time configuration still works.** If you define `FW_VERSION`, `OTA_GITHUB_USER` and `OTA_GITHUB_REPO` (before including the header, or as PlatformIO `build_flags`), `otaInit()` calls `otaBegin()` for you:
+
+```ini
+build_flags =
+    -D FW_VERSION='"1.0.0"'
+    -D OTA_GITHUB_USER='"your-username"'
+    -D OTA_GITHUB_REPO='"your-releases-repo"'
+```
+
 ---
 
 ## Releasing a New Version
@@ -382,7 +398,17 @@ if (g_otaInProgress) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 ./release.sh major "Rewrote audio pipeline"
 ```
 
-The script automatically: reads version → bumps → writes back → builds → SHA-256 → generates `version.json` → creates GitHub Release.
+The script automatically: reads version → bumps → writes back → builds → SHA-256 → (signs) → generates `version.json` → creates GitHub Release → commits the version bump locally (not pushed; `--no-commit` to skip).
+
+| Flag / variable | Effect |
+|---|---|
+| `--dry-run` | Build and generate `version.json`, publish nothing, leave your files untouched |
+| `--allow-dirty` | Don't require a clean git tree |
+| `--no-commit` | Don't commit the version bump after publishing |
+| `OTA_SIGNING_KEY=key.pem` | Sign the release (see Step 4) |
+| `./release.sh keygen [file]` | Create a signing key and print the public key as a C string |
+
+Safety properties: release notes are JSON-escaped (quotes and newlines are fine), an existing tag is never overwritten, and the releases repo is only bootstrapped when GitHub says it is empty. Any other API failure (network, auth, rate limit) aborts without touching the repo.
 
 ![release.sh terminal output showing a successful v1.0.2 → v1.0.3 release](docs/release_script_output.png)
 
@@ -399,15 +425,32 @@ Each release automatically uploads `firmware.bin` and `version.json` to GitHub R
 ## API Reference
 
 ```cpp
-void        otaInit();                           // call once in setup()
-void        otaSetMaintenanceCallback(void(*)()); // register pre-flash callback
+// Configuration (call before otaCheckAsync)
+bool        otaBegin(const char* user, const char* repo, const char* currentVersion);
+void        otaInit();                           // legacy: otaBegin() from FW_VERSION / OTA_GITHUB_USER / OTA_GITHUB_REPO macros
+void        otaSetPublicKey(const char* pem);    // ECDSA P-256 public key; makes a valid signature mandatory
+void        otaSetCACert(const char* pem);       // optional TLS certificate validation
+void        otaAllowUnverified(bool allow);      // allow releases without sha256 (not recommended)
+
+// Callbacks
+void        otaSetMaintenanceCallback(void(*)());                   // before flashing: stop hardware
+void        otaSetFailureCallback(void(*)());                       // install failed: restart hardware
+void        otaSetProgressCallback(void(*)(size_t written, size_t total));
+
+// Operation
 void        otaCheckAsync();                     // non-blocking version check
-String      otaInstall();                        // blocking: download → verify → flash → reboot
-OtaState    otaGetState();
-OtaInfo     otaGetInfo();                        // version, sha256, notes, updateAvailable
+String      otaInstall();                        // blocking: download → verify → flash → reboot; returns an error message
+OtaState    otaGetState();                       // thread-safe
+OtaInfo     otaGetInfo();                        // thread-safe copy: version, sha256, notes, updateAvailable, signatureVerified
 const char* otaStateStr(OtaState s);
 extern volatile bool g_otaInProgress;            // check in your FreeRTOS tasks
+
+// Rollback support
+bool        otaIsPendingVerify();
+bool        otaMarkValid();
 ```
+
+`otaInstall()` only runs after a check found an update (`otaGetInfo().updateAvailable`); it returns `"OTA busy …"` if a check or install is already running.
 
 ### OtaState Values
 
@@ -425,7 +468,9 @@ extern volatile bool g_otaInProgress;            // check in your FreeRTOS tasks
 | `OTA_ERROR_PARSE` | `version.json` missing or malformed |
 | `OTA_ERROR_FLASH` | Write to OTA partition failed |
 | `OTA_ERROR_NO_SPACE` | Not enough flash for firmware |
-| `OTA_ERROR_HASH` | SHA-256 mismatch — firmware rejected |
+| `OTA_ERROR_HASH` | SHA-256 mismatch or missing — firmware rejected |
+| `OTA_ERROR_SIGNATURE` | A public key is set and `version.json` has no valid `sig` — update rejected before any download |
+| `OTA_ERROR_CONFIG` | `otaBegin()` not called, or called with an invalid user/repo/version |
 
 ---
 
@@ -435,6 +480,9 @@ extern volatile bool g_otaInProgress;            // check in your FreeRTOS tasks
 |---|---|
 | Power loss during flash | Active partition untouched — device boots into previous firmware |
 | SHA-256 mismatch | `Update.abort()` called immediately — binary discarded, state → `OTA_ERROR_HASH` |
+| Invalid / missing signature | Rejected at check time, nothing is downloaded — state → `OTA_ERROR_SIGNATURE` |
+| Connection drops mid-download | Detected (`written != Content-Length`) — `Update.abort()`, state → `OTA_ERROR_HTTP` |
+| Any failed install | `g_otaInProgress` is cleared and your failure callback runs so you can restart what the maintenance callback stopped |
 | No WiFi at check time | State → `OTA_ERROR_WIFI` — call `otaCheckAsync()` again after reconnect |
 | HTTP failure | Binary never downloaded — check repo is public and user/repo names are correct |
 | Partition too small | `Update.begin()` fails → `OTA_ERROR_NO_SPACE` — fix `partitions.csv` |
@@ -446,15 +494,15 @@ extern volatile bool g_otaInProgress;            // check in your FreeRTOS tasks
 
 ## Rollback Roadmap
 
-ESP-IDF supports application rollback natively. Planned for a future release:
+The library exposes the ESP-IDF rollback hooks:
 
 ```cpp
-// Mark firmware as valid after healthy boot
-void otaMarkValid();
-// If not called within N seconds, auto-rollback to previous OTA slot
+if (otaIsPendingVerify()) {      // we just booted a freshly flashed image
+  if (selfTestPasses()) otaMarkValid();   // confirm it — otherwise the bootloader may roll back
+}
 ```
 
-**Current**: if new firmware crashes on boot, manually trigger `ESP.restart()` — the previous OTA slot remains available. A watchdog timer is a recommended workaround.
+**Important:** the bootloader only rolls back automatically when it was built with `CONFIG_APP_ROLLBACK_ENABLE`. Stock Arduino-ESP32 builds do **not** enable it, so there `otaMarkValid()` is harmless but nothing rolls back by itself — use it with a custom/ESP-IDF bootloader, and in the meantime keep a watchdog as a safety net. This API has not been exercised on rollback-enabled hardware.
 
 ---
 
@@ -481,10 +529,8 @@ board_build.partitions = partitions.csv
 ### FreeRTOS Multi-Task
 
 ```cpp
-#define FW_VERSION      "1.0.0"
-#define OTA_GITHUB_USER "your-username"
-#define OTA_GITHUB_REPO "your-releases-repo"
-#include "ota_updater.h"
+#include <WiFi.h>
+#include <GitReleaseOTA.h>
 
 void sensorTask(void*) {
   for (;;) {
@@ -494,22 +540,26 @@ void sensorTask(void*) {
   }
 }
 
-void beforeFlash() { i2sStop(); ledOff(); }
+void beforeFlash()      { i2sStop(); ledOff(); }
+void afterFailedFlash() { i2sStart(); }
 
 void setup() {
   WiFi.begin("SSID", "PASSWORD");
   while (WiFi.status() != WL_CONNECTED) delay(500);
   xTaskCreatePinnedToCore(sensorTask, "sensor", 4096, nullptr, 2, nullptr, 1);
+  otaBegin("your-username", "your-releases-repo", "1.0.0");
   otaSetMaintenanceCallback(beforeFlash);
-  otaInit();
+  otaSetFailureCallback(afterFailedFlash);
   otaCheckAsync();
 }
 
-void loop() {
+void loop() {                       // Arduino's loop task has enough stack for otaInstall()
   if (otaGetState() == OTA_UPDATE_AVAILABLE) otaInstall();
   delay(100);
 }
 ```
+
+The full version in [`examples/FreeRTOSMultiTask`](examples/FreeRTOSMultiTask/FreeRTOSMultiTask.ino) runs the install from a dedicated 12 KB task.
 
 ### Scheduled OTA (Every 6 Hours)
 
@@ -522,7 +572,9 @@ void loop() {
     otaCheckAsync();
     lastCheck = millis();
   }
-  if (otaGetState() == OTA_UPDATE_AVAILABLE) otaInstall();
+  if (otaGetState() == OTA_UPDATE_AVAILABLE) {
+    if (!otaInstall().isEmpty()) lastCheck = millis();   // failed: wait a full interval
+  }
   delay(100);
 }
 ```
@@ -531,10 +583,27 @@ void loop() {
 
 ## Security Notes
 
-- **Transport**: HTTPS (TLS encrypted). `setInsecure()` skips certificate validation — acceptable because the URL is hardcoded and SHA-256 provides content integrity.
-- **Content integrity**: SHA-256 is computed over the entire binary during streaming and compared against the hash in `version.json`. Tampered or corrupted binaries are rejected.
+What each mechanism does and does not protect against:
+
+- **SHA-256 alone is an integrity check, not authentication.** The expected hash is downloaded from the same place as the firmware. Against corruption it is sufficient; against someone who can intercept or redirect the connection (rogue Wi-Fi, DNS hijack) it is not, because they can serve a malicious binary *and* its hash. By default the TLS connection is encrypted but the server certificate is **not validated** (`setInsecure()`), and the library prints a warning saying so.
+- **Signatures fix that.** Run `./release.sh keygen`, put the public key in your firmware with `otaSetPublicKey()`, and sign releases with `OTA_SIGNING_KEY`. The device then accepts a release only if `version.json` carries an ECDSA P-256 signature over `"<version>:<sha256>"` made with your private key. Since the hash covers the binary, only firmware you signed can be installed — even over a hostile network. Keep the private key secret and backed up (it is git-ignored by default); if it is lost, devices that trust it can't be updated to anything signed with a new key.
+- **TLS certificate validation (optional).** `otaSetCACert(pem)` validates the server. Note that GitHub serves downloads from several hosts (`github.com`, then a `*.githubusercontent.com` redirect), which can chain to different roots and change over time, so pinned roots need maintenance. Signatures avoid that dependency, which is why they are the recommended mechanism.
+- **Downgrades and revocation.** Only a strictly newer version is installed, so replaying an old signed release does nothing. Signed releases are never revoked, though: any validly signed, newer version will install. If you publish a bad release, fix it by publishing a higher version, not by deleting it.
+- **Unverified releases are refused.** A `version.json` without `sha256` is rejected unless you call `otaAllowUnverified(true)`.
+- **`bin` URL.** Must be `https://`. With a public key set it cannot be used to substitute firmware, since the signed hash must still match.
 - **OTA partition**: Targets `U_FLASH` (inactive app partition). LittleFS / SPIFFS is untouched.
-- **Hardening**: To pin the CA cert for `github.com`, replace `setInsecure()` with the appropriate certificate.
+- **Private repositories** are not supported — devices download anonymously, so the releases repo must be public (embedding a GitHub token in firmware is a bad idea). Keep your source in a separate, private repo.
+
+---
+
+## Testing
+
+```bash
+./tests/run_host_tests.sh   # semver, JSON parsing, SHA-256, ECDSA signatures (needs mbedTLS + openssl; brew install mbedtls)
+./tests/test_release.sh     # release.sh end to end with stubbed gh/pio (needs jq + openssl)
+```
+
+CI (`.github/workflows/ci.yml`) runs both plus a PlatformIO build of every example for ESP32 and ESP32-S3. The HTTP/flash path in `ota_updater.cpp` needs real hardware and a GitHub release to exercise; it is compile-checked but not covered by automated tests.
 
 ---
 

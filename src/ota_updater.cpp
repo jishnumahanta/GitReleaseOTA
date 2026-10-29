@@ -1,75 +1,103 @@
 #include "ota_updater.h"
+#include "gro_core.h"
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <mbedtls/sha256.h>   // hardware-accelerated SHA-256 on ESP32-S3
+#include <esp_ota_ops.h>
+
+// version.json is a few hundred bytes; anything bigger is not ours.
+static const size_t   OTA_MAX_JSON_BYTES   = 4096;
+static const size_t   OTA_PROGRESS_STEP    = 64 * 1024;
+static const uint32_t OTA_STALL_TIMEOUT_MS = 10000;
 
 // ── Global maintenance flag ───────────────────────────────────────────
 volatile bool g_otaInProgress = false;
 
 // ── Internal state ────────────────────────────────────────────────────
-static OtaInfo  s_info  = { "", OTA_BIN_URL, "", "", false, OTA_IDLE };
-static bool     s_busy  = false;
+// s_info and s_busy are touched from the check task (core 0) and the caller's task, so
+// every access goes through s_mtx. Configuration is written once before use.
+static SemaphoreHandle_t s_mtx = xSemaphoreCreateMutex();
+static OtaInfo  s_info;                         // zero state == OTA_IDLE
+static bool     s_busy            = false;      // a check or an install is running
+static bool     s_configured      = false;
+static bool     s_allowUnverified = false;
+static bool     s_warnedInsecure  = false;
+static String   s_version, s_versionUrl, s_defaultBinUrl;
+static const char *s_pubKey = nullptr;
+static const char *s_caCert = nullptr;
 static void   (*s_maintenanceCb)() = nullptr;
+static void   (*s_failureCb)()     = nullptr;
+static void   (*s_progressCb)(size_t, size_t) = nullptr;
 
-void otaSetMaintenanceCallback(void (*cb)()) {
-  s_maintenanceCb = cb;
+namespace {
+struct Lock {
+  Lock()  { if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY); }
+  ~Lock() { if (s_mtx) xSemaphoreGive(s_mtx); }
+};
+
+struct BusyGuard {
+  ~BusyGuard() { Lock l; s_busy = false; }
+};
+}  // namespace
+
+static void setState(OtaState st) {
+  Lock l;
+  s_info.state = st;
 }
+
+void otaSetMaintenanceCallback(void (*cb)()) { s_maintenanceCb = cb; }
+void otaSetFailureCallback(void (*cb)())     { s_failureCb = cb; }
+void otaSetProgressCallback(void (*cb)(size_t, size_t)) { s_progressCb = cb; }
+void otaSetPublicKey(const char *pem)        { s_pubKey = (pem && *pem) ? pem : nullptr; }
+void otaSetCACert(const char *pem)           { s_caCert = (pem && *pem) ? pem : nullptr; }
+void otaAllowUnverified(bool allow)          { s_allowUnverified = allow; }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-static bool versionGreater(const String &a, const String &b) {
-  int ma=0,mi_a=0,pa=0, mb=0,mi_b=0,pb=0;
-  sscanf(a.c_str(), "%d.%d.%d", &ma, &mi_a, &pa);
-  sscanf(b.c_str(), "%d.%d.%d", &mb, &mi_b, &pb);
-  if (ma!=mb)    return ma>mb;
-  if (mi_a!=mi_b) return mi_a>mi_b;
-  return pa>pb;
-}
-
-// Minimal JSON string extractor — no heap allocation
-static String jsonStr(const String &json, const String &field) {
-  String needle = "\"" + field + "\"";
-  int idx = json.indexOf(needle);
-  if (idx < 0) return "";
-  int s = json.indexOf('"', idx + needle.length() + 1);
-  if (s < 0) return ""; s++;
-  int e = json.indexOf('"', s);
-  if (e < 0) return "";
-  return json.substring(s, e);
-}
-
-// Compute hex SHA-256 of a buffer
-static String sha256hex(const uint8_t *data, size_t len) {
-  uint8_t hash[32];
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, data, len);
-  mbedtls_sha256_finish(&ctx, hash);
-  mbedtls_sha256_free(&ctx);
-  String hex = "";
-  hex.reserve(65);
-  for (int i = 0; i < 32; i++) {
-    char tmp[3]; snprintf(tmp, sizeof(tmp), "%02x", hash[i]);
-    hex += tmp;
+static bool validRepoName(const char *s) {
+  if (!s || !*s) return false;
+  for (; *s; s++) {
+    if (!(isalnum((unsigned char)*s) || *s == '.' || *s == '_' || *s == '-')) return false;
   }
-  return hex;
+  return true;
 }
 
-// HTTPS GET with redirect following
+static void configureTls(WiFiClientSecure &client) {
+  if (s_caCert) {
+    client.setCACert(s_caCert);
+  } else {
+    if (!s_warnedInsecure) {
+      s_warnedInsecure = true;
+      Serial.println(s_pubKey
+        ? "[OTA] note: TLS certificate not validated (no CA set); firmware authenticity relies on the signature."
+        : "[OTA] WARNING: TLS certificate not validated and no public key set — firmware is only integrity-checked. See otaSetPublicKey().");
+    }
+    client.setInsecure();
+  }
+}
+
+// HTTPS GET with redirect following; the body is only returned for HTTP 200.
 static String httpsGet(const String &url, int &httpCode) {
   WiFiClientSecure client;
-  client.setInsecure();
+  configureTls(client);
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setTimeout(15000);
-  http.setUserAgent("ESP32-OTA/" FW_VERSION);
+  http.setUserAgent("ESP32-OTA/" + s_version);
   http.begin(client, url);
   httpCode = http.GET();
-  String body = "";
-  if (httpCode == HTTP_CODE_OK) body = http.getString();
+  String body;
+  if (httpCode == HTTP_CODE_OK) {
+    int len = http.getSize();
+    if (len > (int)OTA_MAX_JSON_BYTES) {
+      httpCode = -1;                          // too large to be a version.json
+    } else {
+      body = http.getString();
+      if (body.length() > OTA_MAX_JSON_BYTES) { body = ""; httpCode = -1; }
+    }
+  }
   http.end();
   return body;
 }
@@ -88,113 +116,205 @@ static void enterMaintenanceMode() {
   Serial.println("[OTA] maintenance mode active");
 }
 
+// ── Version check ─────────────────────────────────────────────────────
+
+static void runCheck() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setState(OTA_ERROR_WIFI);
+    return;
+  }
+
+  int code = 0;
+  String body = httpsGet(s_versionUrl, code);
+  if (code != HTTP_CODE_OK || body.isEmpty()) {
+    Serial.printf("[OTA] HTTP %d — version.json fetch failed\n", code);
+    setState(OTA_ERROR_HTTP);
+    return;
+  }
+
+  char ver[40] = "", bin[300] = "", sha[80] = "", sig[220] = "", notes[256] = "";
+  gro_json_get_string(body.c_str(), "version", ver, sizeof(ver));
+  gro_json_get_string(body.c_str(), "bin",     bin, sizeof(bin));
+  gro_json_get_string(body.c_str(), "sha256",  sha, sizeof(sha));
+  gro_json_get_string(body.c_str(), "sig",     sig, sizeof(sig));
+  gro_json_get_string(body.c_str(), "notes",   notes, sizeof(notes));
+
+  bool versionOk = false;
+  int cmp = gro_version_compare(ver, s_version.c_str(), &versionOk);
+  if (!ver[0] || !versionOk) {
+    Serial.println("[OTA] version.json: missing or invalid \"version\"");
+    setState(OTA_ERROR_PARSE);
+    return;
+  }
+  if (bin[0] && strncmp(bin, "https://", 8) != 0) {
+    Serial.println("[OTA] version.json: \"bin\" must be an https:// URL");
+    setState(OTA_ERROR_PARSE);
+    return;
+  }
+  if (sha[0] && !gro_is_sha256_hex(sha)) {
+    Serial.println("[OTA] version.json: \"sha256\" is not 64 hex characters");
+    setState(OTA_ERROR_PARSE);
+    return;
+  }
+  for (char *c = sha; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+  const bool newer = cmp > 0;
+  bool signatureOk = false;
+  if (newer && s_pubKey) {
+    signatureOk = sha[0] && sig[0] && gro_verify_signature(s_pubKey, ver, sha, sig);
+    if (!signatureOk) {
+      Serial.println("[OTA] signature missing or invalid — update rejected");
+      Lock l;
+      s_info.remoteVersion = ver;
+      s_info.updateAvailable = false;
+      s_info.state = OTA_ERROR_SIGNATURE;
+      return;
+    }
+  }
+
+  {
+    Lock l;
+    s_info.remoteVersion     = ver;
+    s_info.binUrl            = bin[0] ? String(bin) : s_defaultBinUrl;
+    s_info.sha256            = sha;
+    s_info.notes             = notes;
+    s_info.updateAvailable   = newer;
+    s_info.signatureVerified = signatureOk;
+    s_info.state             = newer ? OTA_UPDATE_AVAILABLE : OTA_UP_TO_DATE;
+  }
+
+  Serial.printf("[OTA] local=%s remote=%s sha256=%.8s%s -> %s\n",
+    s_version.c_str(), ver, sha[0] ? sha : "none",
+    signatureOk ? " (signed)" : "",
+    newer ? "UPDATE AVAILABLE" : "up to date");
+}
+
+static void checkTask(void *) {
+  Serial.println("[OTA] checking version...");
+  runCheck();
+  { Lock l; s_busy = false; }
+  vTaskDelete(nullptr);
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
-void otaInit() {
-  Serial.printf("[OTA] firmware v%s\n", FW_VERSION);
+bool otaBegin(const char *githubUser, const char *githubRepo, const char *currentVersion) {
+  bool versionOk = false;
+  gro_version_compare(currentVersion, currentVersion, &versionOk);
+  if (!validRepoName(githubUser) || !validRepoName(githubRepo) || !versionOk) {
+    Serial.println("[OTA] otaBegin: invalid user, repo or version");
+    Lock l;
+    s_configured = false;
+    s_info.state = OTA_ERROR_CONFIG;
+    return false;
+  }
+
+  String base = String("https://github.com/") + githubUser + "/" + githubRepo + "/releases/latest/download/";
+  {
+    Lock l;
+    s_version        = currentVersion;
+    s_versionUrl     = base + "version.json";
+    s_defaultBinUrl  = base + "firmware.bin";
+    s_configured     = true;
+    s_info.state     = OTA_IDLE;
+  }
+  Serial.printf("[OTA] firmware v%s\n", currentVersion);
+  return true;
 }
 
 void otaCheckAsync() {
-  if (s_busy) return;
-  s_busy = true;
-  s_info.state = OTA_CHECKING;
-  s_info.updateAvailable = false;
-
-  xTaskCreatePinnedToCore([](void*) {
-    Serial.println("[OTA] checking version...");
-
-    if (WiFi.status() != WL_CONNECTED) {
-      s_info.state = OTA_ERROR_WIFI;
-      s_busy = false; vTaskDelete(nullptr); return;
+  {
+    Lock l;
+    if (s_busy) return;
+    if (!s_configured) {
+      s_info.state = OTA_ERROR_CONFIG;
+      Serial.println("[OTA] not configured — call otaBegin() first");
+      return;
     }
+    s_busy = true;
+    s_info.state = OTA_CHECKING;
+    s_info.updateAvailable = false;
+  }
 
-    int code = 0;
-    String body = httpsGet(OTA_VERSION_URL, code);
-
-    if (code != HTTP_CODE_OK || body.isEmpty()) {
-      Serial.printf("[OTA] HTTP %d — version.json fetch failed\n", code);
-      s_info.state = OTA_ERROR_HTTP;
-      s_busy = false; vTaskDelete(nullptr); return;
-    }
-
-    String remote = jsonStr(body, "version");
-    String binUrl = jsonStr(body, "bin");
-    String sha256 = jsonStr(body, "sha256");
-    String notes  = jsonStr(body, "notes");
-
-    if (remote.isEmpty()) {
-      Serial.println("[OTA] version.json parse error");
-      s_info.state = OTA_ERROR_PARSE;
-      s_busy = false; vTaskDelete(nullptr); return;
-    }
-
-    s_info.remoteVersion   = remote;
-    s_info.binUrl          = binUrl.isEmpty() ? String(OTA_BIN_URL) : binUrl;
-    s_info.sha256          = sha256;
-    s_info.notes           = notes;
-    s_info.updateAvailable = versionGreater(remote, FW_VERSION);
-    s_info.state           = s_info.updateAvailable ? OTA_UPDATE_AVAILABLE : OTA_UP_TO_DATE;
-
-    Serial.printf("[OTA] local=%s remote=%s sha256=%s -> %s\n",
-      FW_VERSION, remote.c_str(),
-      sha256.isEmpty() ? "none" : sha256.substring(0,8).c_str(),
-      s_info.updateAvailable ? "UPDATE AVAILABLE" : "up to date");
-
+  if (xTaskCreatePinnedToCore(checkTask, "ota_check", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
+    Serial.println("[OTA] could not start check task (out of memory)");
+    Lock l;
     s_busy = false;
-    vTaskDelete(nullptr);
-  }, "ota_check", 12288, nullptr, 1, nullptr, 0);
+    s_info.state = OTA_ERROR_HTTP;
+  }
 }
 
-// Blocking install — enters maintenance mode, streams, verifies SHA-256, reboots
+// Blocking install — enters maintenance mode, streams, verifies, reboots.
+// Returns a human-readable error; on success the device restarts and this never returns.
 String otaInstall() {
-  if (WiFi.status() != WL_CONNECTED) return "No WiFi connection";
-  if (s_info.binUrl.isEmpty())        return "No firmware URL — run check first";
+  OtaInfo info;
+  {
+    Lock l;
+    if (!s_configured) return "OTA not configured — call otaBegin()";
+    if (s_busy)        return "OTA busy — a check or install is already running";
+    if (!s_info.updateAvailable || s_info.binUrl.isEmpty())
+      return "No update available — run otaCheckAsync() first";
+    s_busy = true;
+    info = s_info;
+  }
+  BusyGuard guard;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    setState(OTA_ERROR_WIFI);
+    return "No WiFi connection";
+  }
+  if (info.sha256.isEmpty() && !s_allowUnverified) {
+    setState(OTA_ERROR_HASH);
+    return "version.json has no sha256 — refusing to install unverified firmware";
+  }
 
   // 1. Maintenance mode
   enterMaintenanceMode();
 
-  // 2. Download firmware.bin
-  s_info.state = OTA_DOWNLOADING;
-  Serial.printf("[OTA] downloading: %s\n", s_info.binUrl.c_str());
-
   WiFiClientSecure dlClient;
-  dlClient.setInsecure();
+  configureTls(dlClient);
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(60000);
-  http.setUserAgent("ESP32-OTA/" FW_VERSION);
-  http.begin(dlClient, s_info.binUrl);
+  GroSha256 sha;
+  bool updateBegun = false;
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
+  // Every failure path after this point goes through here so cleanup is never skipped.
+  auto fail = [&](OtaState st, const String &msg) -> String {
+    if (updateBegun) Update.abort();
     http.end();
     g_otaInProgress = false;
-    s_info.state = OTA_ERROR_HTTP;
-    return "HTTP " + String(code) + " — download failed";
-  }
+    setState(st);
+    Serial.printf("[OTA] FAILED: %s\n", msg.c_str());
+    if (s_failureCb) s_failureCb();
+    return msg;
+  };
 
-  int contentLen = http.getSize();
+  // 2. Download firmware.bin
+  setState(OTA_DOWNLOADING);
+  Serial.printf("[OTA] downloading: %s\n", info.binUrl.c_str());
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(60000);
+  http.setUserAgent("ESP32-OTA/" + s_version);
+  http.begin(dlClient, info.binUrl);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) return fail(OTA_ERROR_HTTP, "HTTP " + String(code) + " — download failed");
+
+  const int contentLen = http.getSize();
   Serial.printf("[OTA] content-length: %d bytes\n", contentLen);
 
   // 3. Check flash space
-  if (!Update.begin(contentLen > 0 ? (size_t)contentLen : UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-    http.end();
-    g_otaInProgress = false;
-    s_info.state = OTA_ERROR_NO_SPACE;
-    return String("Update.begin failed: ") + Update.errorString();
-  }
+  if (!Update.begin(contentLen > 0 ? (size_t)contentLen : UPDATE_SIZE_UNKNOWN, U_FLASH))
+    return fail(OTA_ERROR_NO_SPACE, String("Update.begin failed: ") + Update.errorString());
+  updateBegun = true;
 
-  // 4. Stream + SHA-256 simultaneously
-  mbedtls_sha256_context sha_ctx;
-  bool doHash = !s_info.sha256.isEmpty();
-  if (doHash) {
-    mbedtls_sha256_init(&sha_ctx);
-    mbedtls_sha256_starts(&sha_ctx, 0);
-  }
+  const bool doHash = !info.sha256.isEmpty();
+  if (doHash && !sha.begin()) return fail(OTA_ERROR_HASH, "Could not start SHA-256");
 
-  WiFiClient *stream  = http.getStreamPtr();
-  size_t written      = 0;
-  size_t target       = (contentLen > 0) ? (size_t)contentLen : SIZE_MAX;
+  // 4. Stream + hash simultaneously
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written     = 0;
+  size_t nextReport  = OTA_PROGRESS_STEP;
+  const size_t target = (contentLen > 0) ? (size_t)contentLen : SIZE_MAX;
   uint8_t buf[1024];
   unsigned long lastProgress = millis();
 
@@ -203,95 +323,75 @@ String otaInstall() {
   while (http.connected() && written < target) {
     size_t avail = stream->available();
     if (!avail) {
-      if (millis() - lastProgress > 10000) {
-        http.end(); Update.abort();
-        if (doHash) mbedtls_sha256_free(&sha_ctx);
-        g_otaInProgress = false;
-        s_info.state = OTA_ERROR_FLASH;
-        return "Stall timeout during download";
-      }
-      delay(1); continue;
+      if (millis() - lastProgress > OTA_STALL_TIMEOUT_MS) return fail(OTA_ERROR_FLASH, "Stall timeout during download");
+      delay(1);
+      continue;
     }
     size_t rd = stream->readBytes(buf, min(avail, sizeof(buf)));
     if (rd == 0) continue;
 
-    if (doHash) mbedtls_sha256_update(&sha_ctx, buf, rd);
+    if (doHash) sha.update(buf, rd);
 
     size_t wr = Update.write(buf, rd);
-    if (wr != rd) {
-      http.end(); Update.abort();
-      if (doHash) mbedtls_sha256_free(&sha_ctx);
-      g_otaInProgress = false;
-      s_info.state = OTA_ERROR_FLASH;
-      return String("Write mismatch: expected ") + rd + " wrote " + wr;
-    }
+    if (wr != rd) return fail(OTA_ERROR_FLASH, String("Write mismatch: expected ") + rd + " wrote " + wr);
     written += wr;
     lastProgress = millis();
 
-    if (written % (64*1024) < sizeof(buf)) {
-      Serial.printf("[OTA] %u / %d bytes (%.0f%%)\n",
-        written, contentLen, contentLen > 0 ? 100.0f*written/contentLen : 0.f);
+    if (written >= nextReport) {
+      nextReport += OTA_PROGRESS_STEP;
+      Serial.printf("[OTA] %u / %d bytes (%.0f%%)\n", (unsigned)written, contentLen,
+                    contentLen > 0 ? 100.0f * written / contentLen : 0.f);
+      if (s_progressCb) s_progressCb(written, contentLen > 0 ? (size_t)contentLen : 0);
     }
   }
+  if (s_progressCb) s_progressCb(written, contentLen > 0 ? (size_t)contentLen : 0);
   http.end();
+
+  // A dropped connection must not be mistaken for a complete download.
+  if (contentLen > 0 && written != (size_t)contentLen)
+    return fail(OTA_ERROR_HTTP, String("Download truncated: ") + (unsigned)written + " of " + contentLen + " bytes");
 
   // 5. SHA-256 verification
   if (doHash) {
-    s_info.state = OTA_VERIFYING;
-    uint8_t hash[32];
-    mbedtls_sha256_finish(&sha_ctx, hash);
-    mbedtls_sha256_free(&sha_ctx);
+    setState(OTA_VERIFYING);
+    char computed[65];
+    if (!sha.finishHex(computed)) return fail(OTA_ERROR_HASH, "SHA-256 computation failed");
 
-    String computed = "";
-    computed.reserve(65);
-    for (int i = 0; i < 32; i++) {
-      char tmp[3]; snprintf(tmp, sizeof(tmp), "%02x", hash[i]);
-      computed += tmp;
-    }
+    Serial.printf("[OTA] SHA-256 expected: %.16s...\n", info.sha256.c_str());
+    Serial.printf("[OTA] SHA-256 computed: %.16s...\n", computed);
 
-    String expected = s_info.sha256;
-    expected.toLowerCase();
-    computed.toLowerCase();
-
-    Serial.printf("[OTA] SHA-256 expected: %.16s...\n", expected.c_str());
-    Serial.printf("[OTA] SHA-256 computed: %.16s...\n", computed.c_str());
-
-    if (computed != expected) {
-      Update.abort();
-      g_otaInProgress = false;
-      s_info.state = OTA_ERROR_HASH;
-      return "SHA-256 mismatch — firmware rejected";
-    }
+    if (info.sha256 != computed) return fail(OTA_ERROR_HASH, "SHA-256 mismatch — firmware rejected");
     Serial.println("[OTA] SHA-256 OK");
   } else {
-    Serial.println("[OTA] no SHA-256 in version.json — skipping hash check");
+    Serial.println("[OTA] WARNING: no SHA-256 in version.json — installing unverified firmware");
   }
 
   // 6. Finalise OTA partition
-  if (!Update.end(true)) {
-    g_otaInProgress = false;
-    s_info.state = OTA_ERROR_FLASH;
-    return String("Update.end failed: ") + Update.errorString();
-  }
-  if (!Update.isFinished()) {
-    g_otaInProgress = false;
-    s_info.state = OTA_ERROR_FLASH;
-    return "Update not finished — partition may be corrupt";
-  }
+  const bool ended = Update.end(true);
+  updateBegun = false;                        // end() released the update either way
+  if (!ended) return fail(OTA_ERROR_FLASH, String("Update.end failed: ") + Update.errorString());
+  if (!Update.isFinished()) return fail(OTA_ERROR_FLASH, "Update not finished — partition may be corrupt");
 
   // 7. Success
-  s_info.state = OTA_SUCCESS;
-  Serial.printf("[OTA] done — wrote %u bytes, rebooting\n", written);
+  setState(OTA_SUCCESS);
+  Serial.printf("[OTA] done — wrote %u bytes, rebooting\n", (unsigned)written);
   Serial.flush();
   delay(500);
   ESP.restart();
   return "";  // never reached
 }
 
-OtaInfo     otaGetInfo()        { return s_info; }
-OtaState    otaGetState()       { return s_info.state; }
+OtaInfo otaGetInfo() {
+  Lock l;
+  return s_info;
+}
 
-const char* otaStateStr(OtaState s) {
+OtaState otaGetState() {
+  Lock l;
+  return s_info.state;
+}
+
+const char *otaStateStr(OtaState s) {
   switch (s) {
     case OTA_IDLE:             return "idle";
     case OTA_CHECKING:         return "checking";
@@ -306,6 +406,20 @@ const char* otaStateStr(OtaState s) {
     case OTA_ERROR_FLASH:      return "error_flash";
     case OTA_ERROR_NO_SPACE:   return "error_no_space";
     case OTA_ERROR_HASH:       return "error_hash";
+    case OTA_ERROR_SIGNATURE:  return "error_signature";
+    case OTA_ERROR_CONFIG:     return "error_config";
     default:                   return "unknown";
   }
+}
+
+// ── Rollback support ──────────────────────────────────────────────────
+
+bool otaIsPendingVerify() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  return running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+bool otaMarkValid() {
+  return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
 }

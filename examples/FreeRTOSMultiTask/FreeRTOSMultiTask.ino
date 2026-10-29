@@ -6,17 +6,21 @@
  *
  * Key points:
  *  - All tasks check g_otaInProgress and pause voluntarily
- *  - beforeFlash() is called after tasks have paused (stops I2S, LEDs, etc.)
- *  - otaCheckAsync() runs on core 0 in its own task — won't block core 1 work
+ *  - beforeFlash() is called after tasks have had time to pause (stops I2S, LEDs, etc.)
+ *  - afterFailedFlash() undoes it if the install fails and the device keeps running
+ *  - otaCheckAsync() runs in its own task — won't block the application tasks
+ *  - otaInstall() runs TLS in the calling task, so the OTA task needs a big stack (12 KB)
  *
  * Hardware: Any ESP32 / ESP32-S3 board
  * Framework: Arduino + FreeRTOS (included with ESP32 Arduino core)
  */
 
-#define FW_VERSION      "1.0.0"
-#define OTA_GITHUB_USER "your-username"       // ← change this
-#define OTA_GITHUB_REPO "your-releases-repo"  // ← change this
-#include "ota_updater.h"
+#include <WiFi.h>
+#include <GitReleaseOTA.h>
+
+const char* FW_VERSION_STR = "1.0.0";                  // version of THIS firmware
+const char* GITHUB_USER    = "your-username";          // ← change this
+const char* GITHUB_REPO    = "your-releases-repo";     // ← change this
 
 // ── Wi-Fi credentials ────────────────────────────────────────────────
 const char* WIFI_SSID = "your-ssid";
@@ -33,7 +37,7 @@ void sensorTask(void*) {
 
     // Normal sensor work
     float temperature = 25.0f; // replace with real sensor read
-    Serial.printf("[SENSOR] temp=%.1f°C\n", temperature);
+    Serial.printf("[SENSOR] temp=%.1f C\n", temperature);
 
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
@@ -55,15 +59,23 @@ void ledTask(void*) {
   }
 }
 
-// ── Maintenance callback — called by OTA just before flash ───────────
-// g_otaInProgress is already true when this is called.
-// Tasks have had 400 ms to notice and pause.
+// ── Maintenance callbacks ────────────────────────────────────────────
+// g_otaInProgress is already true when beforeFlash() is called, and
+// tasks have had 400 ms to notice and pause.
 void beforeFlash() {
   Serial.println("[APP] stopping hardware for OTA...");
   // i2sStop();
   // ledSetState(LED_OFF);
   // sensorPowerDown();
-  Serial.println("[APP] hardware stopped — OTA may proceed");
+}
+
+// Called when the install failed and we are still running: g_otaInProgress is
+// already false again, so the tasks above resume by themselves. Restart anything
+// beforeFlash() powered down.
+void afterFailedFlash() {
+  Serial.println("[APP] OTA failed — restoring hardware");
+  // i2sStart();
+  // sensorPowerUp();
 }
 
 // ── OTA monitor task — checks state and installs when ready ──────────
@@ -74,6 +86,8 @@ void otaMonitorTask(void*) {
       String err = otaInstall();  // blocks until reboot (or error)
       if (!err.isEmpty()) {
         Serial.println("[OTA] install failed: " + err);
+        vTaskDelay(pdMS_TO_TICKS(60UL * 60UL * 1000UL));  // try again in an hour
+        otaCheckAsync();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -85,7 +99,6 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // Wi-Fi
   Serial.printf("Connecting to %s...\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
@@ -98,13 +111,15 @@ void setup() {
   xTaskCreatePinnedToCore(sensorTask, "sensor", 4096, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(ledTask,    "led",    2048, nullptr, 1, nullptr, 1);
 
-  // OTA setup — otaCheckAsync runs on core 0
+  // OTA setup
+  otaBegin(GITHUB_USER, GITHUB_REPO, FW_VERSION_STR);
   otaSetMaintenanceCallback(beforeFlash);
-  otaInit();
+  otaSetFailureCallback(afterFailedFlash);
+  if (otaIsPendingVerify()) otaMarkValid();   // or mark valid later, once your self-test passes
   otaCheckAsync();  // non-blocking — spawns its own FreeRTOS task
 
-  // OTA monitor on core 0 (could also be checked in loop())
-  xTaskCreatePinnedToCore(otaMonitorTask, "ota_mon", 4096, nullptr, 1, nullptr, 0);
+  // otaInstall() does the TLS handshake on this task's stack: 12 KB, not 4 KB.
+  xTaskCreatePinnedToCore(otaMonitorTask, "ota_mon", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
