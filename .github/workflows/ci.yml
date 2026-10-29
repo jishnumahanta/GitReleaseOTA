@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmbedtls-dev jq shellcheck
+      - name: Lint shell scripts
+        run: shellcheck -S warning release.sh tests/run_host_tests.sh tests/test_release.sh
+      - name: Unit tests (parsing, versions, SHA-256, signatures)
+        run: ./tests/run_host_tests.sh
+      - name: release.sh end-to-end (stubbed gh/pio)
+        run: ./tests/test_release.sh
+
+  build-examples:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [esp32dev, esp32-s3-devkitc-1]
+        example: [BasicOTA, ScheduledOTA, FreeRTOSMultiTask]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install platformio
+      - name: Build ${{ matrix.example }} for ${{ matrix.board }}
+        run: |
+          mkdir -p /tmp/proj/src
+          cp "examples/${{ matrix.example }}/${{ matrix.example }}.ino" /tmp/proj/src/main.ino
+          cat > /tmp/proj/platformio.ini <<INI
+          [env:test]
+          platform = espressif32
+          framework = arduino
+          board = ${{ matrix.board }}
+          lib_deps = symlink://${GITHUB_WORKSPACE}
+          build_flags = -Wall -Wextra
+          INI
+          cd /tmp/proj && pio run

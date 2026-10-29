@@ -1,8 +1,18 @@
 {
   "name": "GitReleaseOTA",
-  "version": "1.0.2",
-  "description": "ESP32 OTA updater via GitHub Releases with SHA-256 integrity verification and automated release pipeline.",
-  "keywords": ["ota", "esp32", "github", "firmware", "update", "sha256", "freertos"],
+  "version": "1.1.0",
+  "description": "ESP32 OTA updater via GitHub Releases with SHA-256 integrity verification, optional ECDSA signatures and an automated release pipeline.",
+  "keywords": [
+    "ota",
+    "esp32",
+    "github",
+    "firmware",
+    "update",
+    "sha256",
+    "ecdsa",
+    "signature",
+    "freertos"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/jishnumahanta/GitReleaseOTA.git"
@@ -15,10 +25,26 @@
   ],
   "license": "MIT",
   "homepage": "https://github.com/jishnumahanta/GitReleaseOTA",
-  "frameworks": ["arduino"],
-  "platforms": ["espressif32"],
-  "headers": ["ota_updater.h"],
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "headers": [
+    "GitReleaseOTA.h",
+    "ota_updater.h"
+  ],
   "export": {
-    "include": ["src", "examples", "library.properties", "library.json", "LICENSE", "README.md"]
+    "include": [
+      "src",
+      "examples",
+      "keywords.txt",
+      "library.properties",
+      "library.json",
+      "LICENSE",
+      "README.md",
+      "CHANGELOG.md"
+    ]
   }
 }
